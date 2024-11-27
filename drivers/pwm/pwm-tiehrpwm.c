@@ -387,6 +387,30 @@ static void ehrpwm_pwm_disable(struct pwm_chip *chip, struct pwm_device *pwm)
 	pm_runtime_put_sync(pwmchip_parent(chip));
 }
 
+static bool ehrpwm_is_enabled(struct pwm_chip *chip)
+{
+	struct ehrpwm_pwm_chip *pc = NULL;
+
+	bool ret;
+
+	u16 aqcsfrc_reg;
+	u8 csfa_bits;
+
+	u16 aqctla_reg;
+
+	pc = to_ehrpwm_pwm_chip(chip);
+
+	aqcsfrc_reg	= readw(pc->mmio_base + AQCSFRC);
+	csfa_bits	= (u8)(aqcsfrc_reg & AQCSFRC_CSFA_MASK);
+	
+	aqctla_reg	= readw(pc->mmio_base + AQCTLA);
+
+	ret = 	(csfa_bits != 0u)	? false :
+		(aqctla_reg == 0u) 	? false : true;
+
+	return ret;
+}
+
 static void ehrpwm_pwm_free(struct pwm_chip *chip, struct pwm_device *pwm)
 {
 	struct ehrpwm_pwm_chip *pc = to_ehrpwm_pwm_chip(chip);
@@ -400,11 +424,14 @@ static void ehrpwm_pwm_free(struct pwm_chip *chip, struct pwm_device *pwm)
 	pc->period_cycles[pwm->hwpwm] = 0;
 }
 
+
 static int ehrpwm_pwm_apply(struct pwm_chip *chip, struct pwm_device *pwm,
 			    const struct pwm_state *state)
 {
 	int err;
-	bool enabled = pwm->state.enabled;
+	bool enabled;
+
+	enabled = (ehrpwm_is_enabled(chip) | pwm->state.enabled);
 
 	if (state->polarity != pwm->state.polarity) {
 		if (enabled) {
@@ -417,9 +444,8 @@ static int ehrpwm_pwm_apply(struct pwm_chip *chip, struct pwm_device *pwm,
 			return err;
 	}
 
-	if (!state->enabled) {
-		if (enabled)
-			ehrpwm_pwm_disable(chip, pwm);
+	if ((state->enabled != enabled) && (state->enabled == false)) {
+		ehrpwm_pwm_disable(chip, pwm);
 		return 0;
 	}
 
@@ -427,8 +453,10 @@ static int ehrpwm_pwm_apply(struct pwm_chip *chip, struct pwm_device *pwm,
 	if (err)
 		return err;
 
-	if (!enabled)
+	if ((state->enabled != enabled) && (state->enabled == true)) {
 		err = ehrpwm_pwm_enable(chip, pwm);
+		return err;
+	}
 
 	return err;
 }
