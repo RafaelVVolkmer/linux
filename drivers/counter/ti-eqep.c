@@ -45,6 +45,8 @@
 #define QCTMRLAT	0x1a	/* 0x3e */
 #define QCPRDLAT	0x1c	/* 0x40 */
 
+#define QPOSCTL_PCE     BIT(12)
+
 #define QDECCTL_QSRC_SHIFT	14
 #define QDECCTL_QSRC		GENMASK(15, 14)
 #define QDECCTL_SOEN		BIT(13)
@@ -107,6 +109,12 @@
 #define QCLR_PCE		BIT(1)
 #define QCLR_INT		BIT(0)
 
+#define QCAPCTL_CEN     	BIT(15)
+#define QCAPCTL_CCPS_SHIFT  	4
+#define QCAPCTL_CCPS        	GENMASK(6, 4)
+#define QCAPCTL_UPPS_SHIFT  	0
+#define QCAPCTL_UPPS        	GENMASK(3, 0)
+
 /* EQEP Inputs */
 enum {
 	TI_EQEP_SIGNAL_QEPA,	/* QEPA/XCLK */
@@ -121,10 +129,128 @@ enum ti_eqep_count_func {
 	TI_EQEP_COUNT_FUNC_DOWN_COUNT,
 };
 
+/* Command For Enable/Disable Hardware Counter */
+typedef enum ti_eqep_count_flag {
+    TI_EQEP_MODULE_DISABLE,
+    TI_EQEP_MODULE_ENABLE,
+} eqep_on_off_t;
+
 struct ti_eqep_cnt {
 	struct regmap *regmap32;
 	struct regmap *regmap16;
+    	struct clk *clk;
+    	int irq;
 };
+
+ static int ti_eqep_module_power(struct counter_device *counter, eqep_on_off_t command)
+{
+    int ret = 0u;
+    struct ti_eqep_cnt *priv = NULL;
+ 
+    unsigned int counter_value;
+    unsigned int qepctl_reg;
+    
+    bool is_irq_on;
+
+    u8 phen_bit;
+ 
+    if(counter == NULL) {
+        ret = -ENOMEM;
+        goto end_of_function;
+    }
+ 
+    dev_err(counter->parent, "command: %d!\n", command);
+ 
+    priv = counter_priv(counter);
+   
+    ret = regmap_read(priv->regmap16, QEPCTL, &qepctl_reg);
+    if (ret < 0) {
+        goto end_of_function;
+    }
+ 
+    phen_bit = (u8)((qepctl_reg & QEPCTL_PHEN) >> 3u);
+
+    ret =  irq_get_irqchip_state(priv->irq, IRQCHIP_STATE_ACTIVE, &is_irq_on);
+ 
+    switch(command){
+        case TI_EQEP_MODULE_ENABLE:
+            if ((phen_bit == 0b0) || (pm_runtime_active(counter->parent) == false)) {
+                device_set_wakeup_capable(&counter->dev, true);
+
+                ret = pm_runtime_get_sync(counter->parent);
+                if (ret < 0) {
+                    dev_err(counter->parent, "Failed to runtime sync: %d\n", ret);
+                    pm_runtime_put_noidle(counter->parent);
+                    pm_runtime_set_suspended(counter->parent);
+                    ret = -EIO;
+                    goto end_of_function;
+                }
+
+                ret = clk_prepare_enable(priv->clk);
+                if (ret < 0) {
+                    dev_err(counter->parent, "Failed to enable clock: %d\n", ret);
+                    pm_runtime_put_noidle(counter->parent);
+                    goto end_of_function;
+                }
+
+                regmap_read(priv->regmap32, QPOSCNT, &counter_value);
+                if (counter_value != 0){
+                    regmap_write(priv->regmap32, QPOSCNT, 0);
+                    if (ret < 0) {
+                        dev_err(counter->parent, "Failed to reset QPOSCNT: %d\n", ret);
+                        goto end_of_function;
+                    }
+                }
+                       
+                ret = regmap_set_bits(priv->regmap16, QEPCTL, QEPCTL_PHEN);
+                if (ret < 0) {
+                    dev_err(counter->parent, "Error sto ser QEPCTL_PHEN: %d\n", ret);
+                    goto end_of_function;
+                }
+
+                if(is_irq_on == false) {
+                    enable_irq(priv->irq);
+                }
+
+                dev_err(counter->parent, "eQEP module on!\n");
+            }
+            break;
+ 
+        case TI_EQEP_MODULE_DISABLE:
+            if ((phen_bit == 0b1) || (pm_runtime_active(counter->parent) == true)) {
+                device_set_wakeup_capable(&counter->dev, false);
+
+                if(is_irq_on == true) {
+                    disable_irq(priv->irq);
+                }
+
+                clk_disable_unprepare(priv->clk);
+
+                ret = regmap_clear_bits(priv->regmap16, QEPCTL, QEPCTL_PHEN);
+                if (ret < 0) {
+                    dev_err(counter->parent, "Error set QEPCTL_PHEN value!\n");
+                    goto end_of_function;
+                }
+
+                regmap_read(priv->regmap32, QPOSCNT, &counter_value);
+                if (counter_value != 0){
+                    regmap_write(priv->regmap32, QPOSCNT, 0);
+                }
+               
+                pm_runtime_put_autosuspend(counter->parent);
+ 
+                dev_err(counter->parent, "eQEP module off!\n");
+            }
+            break;
+ 
+        default:
+            ret = -EINVAL;
+            goto end_of_function;
+    }
+ 
+end_of_function:
+    return ret;
+}
 
 static int ti_eqep_count_read(struct counter_device *counter,
 			      struct counter_count *count, u64 *val)
@@ -177,34 +303,55 @@ static int ti_eqep_function_read(struct counter_device *counter,
 
 	return 0;
 }
-
 static int ti_eqep_function_write(struct counter_device *counter,
-				  struct counter_count *count,
-				  enum counter_function function)
+                  struct counter_count *count,
+                  enum counter_function function)
 {
-	struct ti_eqep_cnt *priv = counter_priv(counter);
-	enum ti_eqep_count_func qsrc;
-
-	switch (function) {
-	case COUNTER_FUNCTION_QUADRATURE_X4:
-		qsrc = TI_EQEP_COUNT_FUNC_QUAD_COUNT;
-		break;
-	case COUNTER_FUNCTION_PULSE_DIRECTION:
-		qsrc = TI_EQEP_COUNT_FUNC_DIR_COUNT;
-		break;
-	case COUNTER_FUNCTION_INCREASE:
-		qsrc = TI_EQEP_COUNT_FUNC_UP_COUNT;
-		break;
-	case COUNTER_FUNCTION_DECREASE:
-		qsrc = TI_EQEP_COUNT_FUNC_DOWN_COUNT;
-		break;
-	default:
-		/* should never reach this path */
-		return -EINVAL;
-	}
-
-	return regmap_write_bits(priv->regmap16, QDECCTL, QDECCTL_QSRC,
-				 qsrc << QDECCTL_QSRC_SHIFT);
+    int ret = 0u;
+ 
+    struct ti_eqep_cnt *priv = counter_priv(counter);
+    enum ti_eqep_count_func qsrc;
+ 
+    if(counter == NULL || count == NULL) {
+        ret = -ENOMEM;
+        goto end_of_function;
+    }
+   
+    ret = regmap_update_bits(priv->regmap16, QPOSCTL, QPOSCTL_PCE, 1);
+ 
+    switch (function) {
+        case COUNTER_FUNCTION_QUADRATURE_X4:
+            qsrc = TI_EQEP_COUNT_FUNC_QUAD_COUNT;
+            break;
+        case COUNTER_FUNCTION_PULSE_DIRECTION:
+            qsrc = TI_EQEP_COUNT_FUNC_DIR_COUNT;
+            break;
+        case COUNTER_FUNCTION_INCREASE:
+            qsrc = TI_EQEP_COUNT_FUNC_UP_COUNT;
+            break;
+        case COUNTER_FUNCTION_DECREASE:
+            qsrc = TI_EQEP_COUNT_FUNC_DOWN_COUNT;
+            break;
+        case COUNTER_FUNCTION_ENABLE_PWR:
+            ret = ti_eqep_module_power(counter, TI_EQEP_MODULE_ENABLE);
+            break;
+        case COUNTER_FUNCTION_DISABLE_PWR:
+            ret = ti_eqep_module_power(counter, TI_EQEP_MODULE_DISABLE);
+            break;
+        default:
+            /* should never reach this path */
+            ret = -EINVAL;
+            goto end_of_function;
+    }
+ 
+    if ((function != COUNTER_FUNCTION_DISABLE_PWR) &&
+        (function != COUNTER_FUNCTION_ENABLE_PWR)) {
+        ret = regmap_write_bits(priv->regmap16, QDECCTL, QDECCTL_QSRC,
+                            qsrc << QDECCTL_QSRC_SHIFT);
+    }
+ 
+end_of_function:
+    return ret;
 }
 
 static int ti_eqep_action_read(struct counter_device *counter,
@@ -466,8 +613,7 @@ static int ti_eqep_probe(struct platform_device *pdev)
 	struct counter_device *counter;
 	struct ti_eqep_cnt *priv;
 	void __iomem *base;
-	struct clk *clk;
-	int err, irq;
+	int err;
 
 	counter = devm_counter_alloc(dev, sizeof(*priv));
 	if (!counter)
@@ -488,11 +634,11 @@ static int ti_eqep_probe(struct platform_device *pdev)
 	if (IS_ERR(priv->regmap16))
 		return PTR_ERR(priv->regmap16);
 
-	irq = platform_get_irq(pdev, 0);
-	if (irq < 0)
-		return irq;
+	priv->irq = platform_get_irq(pdev, 0);
+	if (priv->irq < 0)
+		return priv->irq;
 
-	err = devm_request_threaded_irq(dev, irq, NULL, ti_eqep_irq_handler,
+	err = devm_request_threaded_irq(dev, priv->irq, NULL, ti_eqep_irq_handler,
 					IRQF_ONESHOT, dev_name(dev), counter);
 	if (err < 0)
 		return dev_err_probe(dev, err, "failed to request IRQ\n");
@@ -515,9 +661,12 @@ static int ti_eqep_probe(struct platform_device *pdev)
 	pm_runtime_enable(dev);
 	pm_runtime_get_sync(dev);
 
-	clk = devm_clk_get_enabled(dev, NULL);
-	if (IS_ERR(clk))
-		return dev_err_probe(dev, PTR_ERR(clk), "failed to enable clock\n");
+	pm_runtime_use_autosuspend(dev);
+    	pm_runtime_set_autosuspend_delay(dev, 1000u);
+
+	priv->clk = devm_clk_get_enabled(dev, NULL);
+	if (IS_ERR(priv->clk))
+		return dev_err_probe(dev, PTR_ERR(priv->clk), "failed to enable clock\n");
 
 	err = counter_add(counter);
 	if (err < 0) {
